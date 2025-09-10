@@ -1,0 +1,24 @@
+---
+# ClusterIP Service for internal communication
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-demo-service
+  namespace: nginx-demo
+  labels:
+    app: nginx-demo
+    app.kubernetes.io/name: nginx-demo
+    app.kubernetes.io/component: service
+    app.kubernetes.io/part-of: nginx-demo-stack
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx-demo
+    app.kubernetes.io/name: nginx-demo
+    app.kubernetes.io/component: webserver
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+
