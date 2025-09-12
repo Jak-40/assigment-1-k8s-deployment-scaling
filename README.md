@@ -62,10 +62,28 @@ Before deploying this application, ensure your EKS cluster has:
    - ACM certificate for your domain (*.your-domain.com)
    - Metrics Server for HPA
 
+
+
+### Configure kubectl for EKS
+
+Before deploying, ensure your kubectl is configured to connect to your EKS cluster:
+
+```bash
+# Update kubeconfig for your EKS cluster
+aws eks update-kubeconfig --region your-region --name your-cluster-name
+
+# Example:
+aws eks update-kubeconfig --region us-west-2 --name my-eks-cluster
+
+# Verify connection
+kubectl config current-context
+kubectl get nodes
+```
+
 ### Quick Verification
 
 ```bash
-# Verify cluster connectivity
+# Verify cluster connectivity and configuration
 kubectl config current-context
 
 # Check required add-ons
@@ -75,6 +93,8 @@ kubectl get deployment -n kube-system metrics-server
 
 # Verify ACM certificates
 aws acm list-certificates --region your-region
+
+# Note: Make sure to use the same region configured in scripts/deploy.sh
 ```
 
 ## Configuration
@@ -112,6 +132,27 @@ The deployment supports flexible domain configuration through template-based man
 
 ## 🎯 Quick Deployment
 
+### Step 0: Configure Script (Required)
+
+**Before deploying, you must configure the deployment script:**
+
+1. **Update script configuration**:
+   ```bash
+   # Edit scripts/deploy.sh and update these values:
+   CLUSTER_CONTEXT="your-eks-cluster-context"  # Your actual EKS cluster context
+   REGION="your-aws-region"                    # Your AWS region (e.g., us-east-1, eu-west-1)
+   ```
+
+2. **Configure kubectl for your EKS cluster**:
+   ```bash
+   # Update kubeconfig for your EKS cluster
+   aws eks update-kubeconfig --region your-region --name your-cluster-name
+   
+   # Verify connection
+   kubectl config current-context
+   kubectl get nodes
+   ```
+
 ### Option 1: Automated Deployment Script (Recommended)
 
 The simplest way to deploy the application with a custom domain:
@@ -141,6 +182,9 @@ cd scripts
 For manual control or troubleshooting, you can deploy individual components:
 
 ```bash
+# Ensure you have configured kubectl for your EKS cluster first:
+# aws eks update-kubeconfig --region your-region --name your-cluster-name
+
 # Verify you're connected to the correct cluster
 kubectl config current-context
 
