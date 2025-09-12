@@ -141,6 +141,7 @@ The deployment supports flexible domain configuration through template-based man
    # Edit scripts/deploy.sh and update these values:
    CLUSTER_CONTEXT="your-eks-cluster-context"  # Your actual EKS cluster context
    REGION="your-aws-region"                    # Your AWS region (e.g., us-east-1, eu-west-1)
+   DEFAULT_DOMAIN="nginx-demo.yourdomain.com"  # Optional: Change default domain (used when no domain is provided)
    ```
 
 2. **Configure kubectl for your EKS cluster**:

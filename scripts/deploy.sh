@@ -85,18 +85,18 @@ check_prerequisites() {
         log_warning "Namespace 'nginx-demo' does not exist, it will be created"
     fi
     
-    # Check ACM certificate
-    log_info "Checking for ACM certificate for *.${DOMAIN_NAME#*.}"
-    local cert_arn
-    cert_arn=$(aws acm list-certificates --region us-west-2 --query "CertificateSummaryList[?DomainName=='*.${DOMAIN_NAME#*.}'].CertificateArn" --output text)
+    # # Check ACM certificate
+    # log_info "Checking for ACM certificate for *.${DOMAIN_NAME#*.}"
+    # local cert_arn
+    # cert_arn=$(aws acm list-certificates --region "$REGION" --query "CertificateSummaryList[?DomainName=='*.${DOMAIN_NAME#*.}'].CertificateArn" --output text)
     
-    if [[ -z "$cert_arn" ]]; then
-        log_warning "No ACM wildcard certificate found for *.${DOMAIN_NAME#*.}"
-        log_info "Please ensure you have a valid ACM certificate for your domain"
-        log_info "The ingress will use automatic certificate discovery"
-    else
-        log_success "Found ACM certificate: $cert_arn"
-    fi
+    # if [[ -z "$cert_arn" ]]; then
+    #     log_warning "No ACM wildcard certificate found for *.${DOMAIN_NAME#*.}"
+    #     log_info "Please ensure you have a valid ACM certificate for your domain"
+    #     log_info "The ingress will use automatic certificate discovery"
+    # else
+    #     log_success "Found ACM certificate: $cert_arn"
+    # fi
     
     log_success "Prerequisites check completed"
 }
@@ -148,24 +148,76 @@ deploy_manifests() {
     log_success "All manifests deployed"
 }
 
+# Function to check resource deployment status
+check_deployment_status() {
+    local retries=5
+    local count=0
+    
+    log_info "Checking deployment status..."
+    
+    while [[ $count -lt $retries ]]; do
+        if kubectl get deployment nginx-demo-deployment -n nginx-demo &>/dev/null; then
+            log_success "Deployment found"
+            break
+        fi
+        
+        ((count++))
+        log_info "Waiting for deployment to be created... (attempt $count/$retries)"
+        sleep 5
+    done
+    
+    if [[ $count -eq $retries ]]; then
+        log_error "Deployment not found after $retries attempts"
+        return 1
+    fi
+    
+    return 0
+}
+
 # Function to wait for deployment
 wait_for_deployment() {
-    log_info "Waiting for deployment to be ready..."
+    log_info "Waiting for all resources to be ready..."
     
-    # Wait for deployment
-    if kubectl wait --for=condition=available deployment/nginx-demo -n nginx-demo --timeout=300s; then
-        log_success "Nginx deployment is ready"
-    else
-        log_warning "Deployment may not be fully ready, checking status..."
-        kubectl get deployment nginx-demo -n nginx-demo
+    # First check if deployment exists
+    if ! check_deployment_status; then
+        log_error "Deployment check failed"
+        return 1
     fi
+    
+    # Wait for deployment rollout
+    log_info "Waiting for deployment rollout to complete..."
+    if kubectl rollout status deployment/nginx-demo-deployment -n nginx-demo --timeout=300s; then
+        log_success "Nginx deployment rollout completed"
+    else
+        log_warning "Deployment rollout may not be complete, checking status..."
+        kubectl get deployment nginx-demo-deployment -n nginx-demo
+    fi
+    
+    # Wait for pods to be ready
+    log_info "Waiting for pods to be ready..."
+    local pod_retries=12
+    local pod_count=0
+    
+    while [[ $pod_count -lt $pod_retries ]]; do
+        local ready_pods
+        ready_pods=$(kubectl get pods -n nginx-demo -l app=nginx-demo --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+        
+        if [[ $ready_pods -gt 0 ]]; then
+            log_success "$ready_pods pod(s) are running"
+            break
+        fi
+        
+        ((pod_count++))
+        echo -n "."
+        sleep 5
+    done
     
     # Wait for ingress
     log_info "Waiting for ingress to get an address..."
-    local retries=30
-    local count=0
+    local ingress_retries=30
+    local ingress_count=0
     
-    while [[ $count -lt $retries ]]; do
+    while [[ $ingress_count -lt $ingress_retries ]]; do
         local address
         address=$(kubectl get ingress nginx-demo-ingress -n nginx-demo -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
         
@@ -174,19 +226,58 @@ wait_for_deployment() {
             break
         fi
         
-        ((count++))
+        ((ingress_count++))
         echo -n "."
         sleep 10
     done
     
-    if [[ $count -eq $retries ]]; then
+    if [[ $ingress_count -eq $ingress_retries ]]; then
         log_warning "Ingress address not available after 5 minutes"
         log_info "You can check the ingress status with: kubectl get ingress -n nginx-demo"
     fi
 }
 
+# Function to display comprehensive deployment status
+show_deployment_status() {
+    log_info "Current deployment status:"
+    echo ""
+    
+    # Namespace
+    echo "======================== NAMESPACE ========================"
+    kubectl get namespace nginx-demo 2>/dev/null || echo "Namespace not found"
+    echo ""
+    
+    # Deployment
+    echo "======================== DEPLOYMENT ========================"
+    kubectl get deployment nginx-demo-deployment -n nginx-demo 2>/dev/null || echo "Deployment not found"
+    echo ""
+    
+    # Pods
+    echo "======================== PODS ========================"
+    kubectl get pods -n nginx-demo -l app=nginx-demo 2>/dev/null || echo "No pods found"
+    echo ""
+    
+    # Service
+    echo "======================== SERVICE ========================"
+    kubectl get service nginx-demo-service -n nginx-demo 2>/dev/null || echo "Service not found"
+    echo ""
+    
+    # Ingress
+    echo "======================== INGRESS ========================"
+    kubectl get ingress nginx-demo-ingress -n nginx-demo 2>/dev/null || echo "Ingress not found"
+    echo ""
+    
+    # HPA
+    echo "======================== HORIZONTAL POD AUTOSCALER ========================"
+    kubectl get hpa nginx-demo-hpa -n nginx-demo 2>/dev/null || echo "HPA not found"
+    echo ""
+}
+
 # Function to display access information
 show_access_info() {
+    # Show current status
+    show_deployment_status
+
     log_info "Deployment completed! Access information:"
     echo ""
     echo "Application URL: https://$DOMAIN_NAME"
@@ -196,9 +287,26 @@ show_access_info() {
     echo "  kubectl get ingress -n nginx-demo"
     echo ""
     echo "To view logs:"
-    echo "  kubectl logs -f deployment/nginx-demo -n nginx-demo"
+    echo "  kubectl logs -f deployment/nginx-demo-deployment -n nginx-demo"
     echo ""
     echo "Note: DNS propagation may take a few minutes for the domain to be accessible."
+    echo ""
+}
+
+# Function to handle deployment errors
+handle_deployment_error() {
+    log_error "Deployment encountered an error. Showing current status..."
+    show_deployment_status
+    
+    log_info "Troubleshooting tips:"
+    echo "1. Check if all prerequisites are met (AWS Load Balancer Controller, External DNS, etc.)"
+    echo "2. Verify ACM certificate exists for your domain"
+    echo "3. Check cluster permissions and connectivity"
+    echo "4. Review the events above for specific error messages"
+    echo ""
+    echo "To cleanup and retry:"
+    echo "  ./cleanup.sh"
+    echo "  ./deploy.sh your-domain.com"
 }
 
 # Function to cleanup temp files
@@ -227,11 +335,27 @@ main() {
     # Setup cleanup trap
     trap cleanup EXIT
     
-    # Execute deployment steps
-    check_prerequisites
-    process_templates
-    deploy_manifests
-    wait_for_deployment
+    # Execute deployment steps with error handling
+    if ! check_prerequisites; then
+        handle_deployment_error
+        exit 1
+    fi
+    
+    if ! process_templates; then
+        handle_deployment_error
+        exit 1
+    fi
+    
+    if ! deploy_manifests; then
+        handle_deployment_error
+        exit 1
+    fi
+    
+    if ! wait_for_deployment; then
+        log_warning "Deployment may not be fully ready, but continuing..."
+        show_deployment_status
+    fi
+    
     show_access_info
     
     log_success "Deployment completed successfully!"
