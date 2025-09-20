@@ -1,0 +1,255 @@
+name: Deploy Nginx to EKS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'k8s-manifests/**'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'k8s-manifests/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  CENTRAL_BACKEND_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+
+permissions:
+  id-token: write   # Required for OIDC
+  contents: read    # Required to read repository contents
+  pull-requests: write  # Required to comment on PRs
+
+jobs:
+  # Deploy nginx to EKS cluster with integrated infrastructure info
+  deploy-to-eks:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    
+    environment:
+      name: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ env.CENTRAL_BACKEND_ROLE_ARN }}
+        role-session-name: GitHub_to_AWS_via_FederatedOIDC_Deploy
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Set environment variables and update kubeconfig
+      id: infrastructure
+      run: |
+        echo "=== Setting up EKS cluster connection ==="
+        
+        # Hard-coded cluster configurations per environment
+        if [ "${{ env.ENVIRONMENT }}" = "dev" ]; then
+          CLUSTER_NAME="mithi-eks-dev"
+          AWS_REGION_FULL="us-east-1"
+          DOMAIN_NAME="mithi-dev.com"
+        elif [ "${{ env.ENVIRONMENT }}" = "staging" ]; then
+          CLUSTER_NAME="mithi-eks-staging"
+          AWS_REGION_FULL="us-east-1"
+          DOMAIN_NAME="mithi-staging.com"
+        elif [ "${{ env.ENVIRONMENT }}" = "prod" ]; then
+          CLUSTER_NAME="mithi-eks-prod"
+          AWS_REGION_FULL="us-east-1"
+          DOMAIN_NAME="mithi-prod.com"
+        else
+          echo "Unknown environment: ${{ env.ENVIRONMENT }}"
+          exit 1
+        fi
+        
+        echo "Cluster: $CLUSTER_NAME"
+        echo "Region: $AWS_REGION_FULL"
+        echo "Domain: $DOMAIN_NAME"
+        
+        echo "AWS_REGION_FULL=${AWS_REGION_FULL}" >> $GITHUB_OUTPUT
+        echo "DOMAIN_NAME=${DOMAIN_NAME}" >> $GITHUB_OUTPUT
+        echo "CLUSTER_NAME=${CLUSTER_NAME}" >> $GITHUB_OUTPUT
+        
+        # Update kubeconfig
+        aws eks update-kubeconfig \
+          --region $AWS_REGION_FULL \
+          --name $CLUSTER_NAME
+        
+        echo "=== EKS cluster connection established ==="
+
+    - name: Verify cluster connection
+      run: |
+        echo "=== Verifying cluster connection ==="
+        kubectl cluster-info
+        kubectl get nodes
+
+    - name: Create ingress template from domain
+      env:
+        DOMAIN_NAME: ${{ steps.infrastructure.outputs.DOMAIN_NAME }}
+      run: |
+        echo "=== Processing ingress template ==="
+        if [ ! -z "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "null" ]; then
+          echo "Configuring ingress with domain: nginx-demo.$DOMAIN_NAME"
+          export DOMAIN_NAME="nginx-demo.$DOMAIN_NAME"
+          envsubst < k8s-manifests/03-ingress.yaml.template > k8s-manifests/03-ingress.yaml
+          echo "Generated ingress for: nginx-demo.$DOMAIN_NAME"
+        else
+          echo "No domain configured, using default ingress template"
+          cp k8s-manifests/03-ingress.yaml.template k8s-manifests/03-ingress.yaml
+        fi
+
+    - name: Apply Kubernetes manifests in order
+      run: |
+        echo "=== Deploying Kubernetes manifests ==="
+        
+        # Apply manifests in specific order based on dependencies
+        manifests=(
+          "00-namespace.yaml"
+          "01-deployment.yaml"
+          "02-service.yaml"
+          "03-ingress.yaml"
+          "04-hpa.yaml"
+        )
+        
+        for manifest in "${manifests[@]}"; do
+          if [[ -f "k8s-manifests/$manifest" ]]; then
+            echo "Applying $manifest..."
+            kubectl apply -f "k8s-manifests/$manifest"
+          else
+            echo "Warning: Manifest not found: k8s-manifests/$manifest"
+          fi
+        done
+
+    - name: Wait for deployment rollout
+      run: |
+        echo "=== Waiting for deployment to be ready ==="
+        
+        # Wait for namespace to be ready
+        kubectl wait --for=condition=Active namespace/nginx-demo --timeout=60s
+        
+        # Wait for deployment rollout
+        kubectl rollout status deployment/nginx-demo-deployment -n nginx-demo --timeout=300s
+        
+        # Wait for pods to be ready
+        echo "Waiting for pods to be ready..."
+        kubectl wait --for=condition=Ready pods -l app=nginx-demo -n nginx-demo --timeout=300s
+        
+        # Wait for HPA to be available
+        echo "Waiting for HPA to be available..."
+        kubectl wait --for=condition=Available hpa/nginx-demo-hpa -n nginx-demo --timeout=120s || echo "HPA not ready, continuing..."
+
+    - name: Verify deployment and show status
+      run: |
+        echo "=== Deployment Status ==="
+        echo "Namespace:"
+        kubectl get namespace nginx-demo
+        echo ""
+        echo "Deployments:"
+        kubectl get deployments -n nginx-demo -o wide
+        echo ""
+        echo "Pods:"
+        kubectl get pods -n nginx-demo -o wide
+        echo ""
+        echo "Services:"
+        kubectl get services -n nginx-demo
+        echo ""
+        echo "Ingress:"
+        kubectl get ingress -n nginx-demo
+        echo ""
+        echo "HPA:"
+        kubectl get hpa -n nginx-demo
+
+    - name: Test application health endpoints
+      env:
+        DOMAIN_NAME: ${{ steps.infrastructure.outputs.DOMAIN_NAME }}
+      run: |
+        echo "=== Testing application health ==="
+        
+        # Test pod health directly
+        echo "Testing pod health endpoint..."
+        kubectl exec -it deployment/nginx-demo-deployment -n nginx-demo -- curl -s http://localhost:8080/health || echo "Pod health check failed"
+        
+        # Test with domain if available
+        if [ ! -z "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "null" ]; then
+          echo "Testing with domain: nginx-demo.$DOMAIN_NAME"
+          for i in {1..10}; do
+            echo "Health check attempt $i/10..."
+            if curl -f "http://nginx-demo.$DOMAIN_NAME/health" > /dev/null 2>&1; then
+              echo "✅ Domain health check passed!"
+              echo "Health endpoint response:"
+              curl -s "http://nginx-demo.$DOMAIN_NAME/health" || echo "No response body"
+              break
+            fi
+            if [ $i -lt 10 ]; then
+              echo "❌ Health check failed, retrying in 30 seconds..."
+              sleep 30
+            else
+              echo "❌ Health check failed after 10 attempts"
+            fi
+          done
+        else
+          echo "No domain configured, skipping domain health check"
+          echo "Application should be accessible via load balancer service"
+        fi
+
+    - name: Deployment summary
+      env:
+        CLUSTER_NAME: ${{ steps.infrastructure.outputs.CLUSTER_NAME }}
+        AWS_REGION_FULL: ${{ steps.infrastructure.outputs.AWS_REGION_FULL }}
+        DOMAIN_NAME: ${{ steps.infrastructure.outputs.DOMAIN_NAME }}
+      run: |
+        echo "=== Generating deployment summary ==="
+        
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cluster**: $CLUSTER_NAME" >> $GITHUB_STEP_SUMMARY
+        echo "- **Region**: $AWS_REGION_FULL" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Git Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        if [ ! -z "$DOMAIN_NAME" ] && [ "$DOMAIN_NAME" != "null" ]; then
+          echo "- **Domain**: http://nginx-demo.$DOMAIN_NAME" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Pods Status" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get pods -n nginx-demo >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Service Status" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get service nginx-demo-service -n nginx-demo >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Ingress Status" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get ingress nginx-demo-ingress -n nginx-demo >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### HPA Status" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        kubectl get hpa nginx-demo-hpa -n nginx-demo >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        
+        echo "## ✅ Deployment completed successfully!" >> $GITHUB_STEP_SUMMARY
